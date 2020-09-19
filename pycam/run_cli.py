@@ -24,6 +24,15 @@ import logging
 import os
 import sys
 
+# we need the multiprocessing exception for remote connections
+try:
+    import multiprocessing
+    from multiprocessing import AuthenticationError
+except ImportError:
+    multiprocessing = None
+    # use an arbitrary other Exception
+    AuthenticationError = socket.error
+
 try:
     from pycam import VERSION
 except ImportError:
@@ -46,10 +55,37 @@ LOG_LEVELS = {"debug": logging.DEBUG,
               "warning": logging.WARNING,
               "error": logging.ERROR, }
 
+EXIT_CODES = {"ok": 0,
+              "server_without_password": 5,
+              "connection_error": 6
+              }
+
 
 def get_args():
     parser = argparse.ArgumentParser(prog="PyCAM", description="scriptable PyCAM processing flow",
                                      epilog="PyCAM website: https://github.com/SebKuzminsky/pycam")
+    # general options
+    group_processing = parser.add_argument_group("Processing")
+    group_processing.add_argument(
+        "--number-of-processes", dest="parallel_processes", default=None, type=int,
+        action="store",
+        help=("override the default detection of multiple CPU cores. Parallel processing only "
+              "works with Python 2.6 (or later) or with the additional 'multiprocessing' module."))
+    group_processing.add_argument(
+        "--enable-server", dest="enable_server", default=False, action="store_true",
+        help="enable a local server and (optionally) remote worker servers.")
+    group_processing.add_argument(
+        "--remote-server", dest="remote_server", default=None, action="store",
+        help=("Connect to a remote task server to distribute the processing load. "
+              "The server is given as an IP or a hostname with an optional port (default: 1250) "
+              "separated by a colon."))
+    group_processing.add_argument(
+        "--start-server-only", dest="start_server", default=False, action="store_true",
+        help="Start only a local server for handling remote requests.")
+    group_processing.add_argument(
+        "--server-auth-key", dest="server_authkey", default="", action="store",
+        help=("Secret used for connecting to a remote server or for granting access to remote "
+              "clients."))
     parser.add_argument("--log-level", choices=LOG_LEVELS.keys(), default="warning",
                         help="choose the verbosity of log messages")
     parser.add_argument("sources", metavar="FLOW_SPEC", type=argparse.FileType('r'), nargs="+",
@@ -68,6 +104,38 @@ def main_func():
             print("Flow description parse failure ({}): {}".format(fname, exc), file=sys.stderr)
             sys.exit(1)
     pycam.Utils.set_application_key("pycam-cli")
+
+    # check if server-auth-key is given -> this is mandatory for server mode
+    if (args.enable_server or args.start_server) and not args.server_authkey:
+        parser.error(
+            "You need to supply a shared secret for server mode. This is supposed to prevent you "
+            "from exposing your host to remote access without authentication.\nPlease add the "
+            "'--server-auth-key' argument followed by a shared secret password.")
+        return EXIT_CODES["server_without_password"]
+    
+    # initialize multiprocessing
+    try:
+        if args.server_authkey is None:
+            server_auth_key = None
+        else:
+            server_auth_key = args.server_authkey.encode("utf-8")
+        if args.start_server:
+            pycam.Utils.threading.init_threading(
+                args.parallel_processes, remote=args.remote_server, run_server=True,
+                server_credentials=server_auth_key)
+            pycam.Utils.threading.cleanup()
+            return EXIT_CODES["ok"]
+        else:
+            pycam.Utils.threading.init_threading(
+                args.parallel_processes, enable_server=args.enable_server,
+                remote=args.remote_server, server_credentials=server_auth_key)
+    except socket.error as err_msg:
+        log.error("Failed to connect to remote server: %s", err_msg)
+        return EXIT_CODES["connection_error"]
+    except AuthenticationError as err_msg:
+        log.error("The remote server rejected your authentication key: %s", err_msg)
+        return EXIT_CODES["connection_error"]
+
     for export in pycam.workspace.data_models.Export.get_collection():
         export.run_export()
 
